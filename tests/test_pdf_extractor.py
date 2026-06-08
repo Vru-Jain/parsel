@@ -45,6 +45,43 @@ class TestOcrTableReconstruction:
     def test_too_few_boxes_returns_empty(self):
         assert _boxes_to_table([_box(10, 10, "x")], page_w=500).empty
 
+    def test_title_block_does_not_bridge_columns(self):
+        """Regression (scanned Rolls-Royce parts list): sparse title-block text
+        ABOVE the header (e.g. 'Assembly Name' centred between the item-no and
+        part-no columns) must not bridge the x-gap and merge the two columns.
+        Columns are clustered from the table region only, so the header row's
+        'Item No.'/'Part Number' stay separate and the table is recognised."""
+        res = [
+            # title-block metadata sitting between the two left columns
+            _box(178, 100, "Assembly Name", w=140),
+            _box(224, 140, "Assembly Dwg. No.", w=160),
+            # header row
+            _box(125, 300, "Item No.", w=70), _box(300, 300, "Part Number", w=90),
+            _box(770, 300, "Description", w=120), _box(1300, 300, "Quantity", w=80),
+            # data rows
+            _box(125, 340, "31"), _box(300, 340, "5451935-000", w=90),
+            _box(770, 340, "FLANGE", w=80), _box(1300, 340, "1"),
+            _box(125, 380, "32"), _box(300, 380, "3693136", w=90),
+            _box(770, 380, "O-RING", w=80), _box(1300, 380, "2"),
+        ]
+        df = _boxes_to_table(res, page_w=1700)
+        assert "Item No." in df.columns, f"columns merged: {list(df.columns)}"
+        assert "Part Number" in df.columns
+        assert "5451935-000" in df["Part Number"].astype(str).tolist()
+        assert "31" in df["Item No."].astype(str).tolist()
+
+    def test_unheadered_text_column_named_description(self):
+        """An un-captioned free-text column is renamed 'Description' so it maps
+        to Part Name downstream (Rolls-Royce parts lists omit the name header)."""
+        res = [
+            _box(100, 50, "No.", w=40), _box(700, 50, "Qty", w=40),
+            _box(100, 100, "1"), _box(400, 100, "FLANGE", w=80), _box(700, 100, "2"),
+            _box(100, 150, "2"), _box(400, 150, "BEARING", w=80), _box(700, 150, "1"),
+        ]
+        df = _boxes_to_table(res, page_w=900)
+        assert "Description" in df.columns, f"got {list(df.columns)}"
+        assert "FLANGE" in df["Description"].astype(str).tolist()
+
 
 class TestRowsToDf:
     def test_first_row_becomes_header(self):

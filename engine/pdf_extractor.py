@@ -49,6 +49,10 @@ class ExtractionResult:
     total_pages: int = 0
     scanned_pages: list[int] = field(default_factory=list)  # 1-based, no text layer
     ocr_used: bool = False
+    # why OCR did or didn't run: "ran" | "disabled" (config) | "unavailable"
+    # (no engine installed) | "not_needed" (no scanned pages). Lets the caller
+    # word the scanned-PDF warning accurately instead of always blaming config.
+    ocr_status: str = "not_needed"
     # reconciliation: pages where an independent item-number count exceeded the
     # rows we actually extracted -> possible missed rows. (page_no, seen, got)
     reconciliation: list[tuple[int, int, int]] = field(default_factory=list)
@@ -397,7 +401,10 @@ def _rapidocr_page_to_df(mu_page: "fitz.Page", eng) -> pd.DataFrame:
             img = img[:, :, :3]
         elif pix.n == 1:
             img = np.repeat(img, 3, axis=2)
-        res, _ = eng(np.ascontiguousarray(img))
+        # use_cls=False skips the 180°-rotation classifier: scanned manuals are
+        # essentially always upright, and skipping it cuts OCR time ~25% with
+        # byte-identical detections/confidence (measured on real scanned pages).
+        res, _ = eng(np.ascontiguousarray(img), use_cls=False)
     except Exception:
         return pd.DataFrame()
     if not res:
@@ -407,8 +414,8 @@ def _rapidocr_page_to_df(mu_page: "fitz.Page", eng) -> pd.DataFrame:
 
 # header tokens we expect on a parts page — used to find the header row
 _OCR_HEADER_TOKENS = {
-    "no", "name", "type", "qt", "qty", "plate", "remaker", "remark", "remarks",
-    "designation", "description", "item", "itemno", "part", "partno",
+    "no", "name", "type", "qt", "qty", "quantity", "plate", "remaker", "remark",
+    "remarks", "designation", "description", "item", "itemno", "part", "partno",
     "partnumber", "pos", "posno", "drawing", "ref", "refno", "code", "material",
     "maker", "unit", "spec",
 }
@@ -421,9 +428,19 @@ _OCR_ROW_SKIP_PREFIXES = (
 )
 
 
+def _norm_ocr(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
-    """Reconstruct a table from RapidOCR boxes: cluster cells into rows (by y)
-    and columns (by x), detect the header row, return a DataFrame."""
+    """Reconstruct a table from RapidOCR boxes: cluster cells into rows (by y),
+    locate the header row, derive columns from the table region, return a df.
+
+    Columns are clustered from the table region ONLY (the header row and below),
+    not the whole page — otherwise sparse title-block metadata above the table
+    (e.g. "Assembly Name", "Assembly Dwg. No.") sits between the item-number and
+    part-number columns and bridges the x-gap, merging two real columns into one
+    and destroying the header detection."""
     cells, heights = [], []
     for box, text, score in res:
         t = (text or "").strip()
@@ -451,8 +468,23 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
             cur, cur_y = [c], c["cy"]
     rows.append(cur)
 
-    # ---- cluster columns by x (gap split) ----
-    centers = sorted(c["cx"] for c in cells)
+    # ---- find the header row: the band with the most cells whose OWN text is a
+    # known header token (checked per raw cell, BEFORE any column merge) ----
+    best_i, best_score = -1, 0
+    for ri, row in enumerate(rows):
+        sc = sum(1 for c in row if _norm_ocr(c["t"]) in _OCR_HEADER_TOKENS)
+        if sc > best_score:
+            best_score, best_i = sc, ri
+
+    # No recognizable parts header (caution page, nameplate/spec sheet, prose)
+    # -> not a parts table. Returning empty makes the page report "no table"
+    # instead of dumping generic, jumbled col0/col1 rows.
+    if best_score < 2:
+        return pd.DataFrame()
+
+    # ---- cluster columns by x using only the table region (header + below) ----
+    region_rows = rows[best_i:]
+    centers = sorted(c["cx"] for row in region_rows for c in row)
     colgap = max(40.0, page_w * 0.035)
     grp, colcenters = [centers[0]], []
     for x in centers[1:]:
@@ -468,30 +500,14 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
         return min(range(ncol), key=lambda i: abs(cx - colcenters[i]))
 
     grid = []
-    for row in rows:
+    for row in region_rows:
         bycol = {}
         for c in sorted(row, key=lambda c: c["cx"]):
             i = col_of(c["cx"])
             bycol[i] = (bycol.get(i, "") + " " + c["t"]).strip()
         grid.append(bycol)
 
-    # ---- find the header row (most cells that look like known headers) ----
-    def _norm(s):
-        return re.sub(r"[^a-z0-9]", "", s.lower())
-
-    best_i, best_score = -1, 0
-    for ri, g in enumerate(grid):
-        sc = sum(1 for v in g.values() if _norm(v) in _OCR_HEADER_TOKENS)
-        if sc > best_score:
-            best_score, best_i = sc, ri
-
-    # No recognizable parts header (caution page, nameplate/spec sheet, prose)
-    # -> not a parts table. Returning empty makes the page report "no table"
-    # instead of dumping generic, jumbled col0/col1 rows.
-    if best_score < 2:
-        return pd.DataFrame()
-
-    header, data_rows = grid[best_i], grid[best_i + 1:]
+    header, data_rows = grid[0], grid[1:]
 
     colnames, seen = [], {}
     for i in range(ncol):
@@ -511,13 +527,48 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
             continue
         low = [c.lower() for c in nonempty]
         # drop a leaked secondary header row (e.g. the "TYPE / QT." band)
-        if sum(1 for c in low if _norm(c) in _OCR_HEADER_TOKENS) >= 2:
+        if sum(1 for c in low if _norm_ocr(c) in _OCR_HEADER_TOKENS) >= 2:
             continue
         # drop caution / instruction / note prose
         if any(c.startswith(_OCR_ROW_SKIP_PREFIXES) for c in low):
             continue
         records.append({colnames[i]: cells[i] for i in range(ncol)})
-    return pd.DataFrame(records) if records else pd.DataFrame()
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    # An un-headered column that is mostly free text is the description/part-name
+    # column (common in parts lists where the name column has no caption). Rename
+    # it "Description" so the column mapper recognises it as the Part Name.
+    df = _name_description_column(df)
+    return df
+
+
+def _name_description_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename a single auto-named ('colN') column to 'Description' when it holds
+    mostly alphabetic free text and is the widest such column — so it maps to
+    Part Name downstream instead of being dropped as unmapped."""
+    auto = [c for c in df.columns if re.fullmatch(r"col\d+", str(c))]
+    if not auto:
+        return df
+    # already have a name/description/designation column -> nothing to rescue
+    _name_like = ("desc", "name", "designation", "denomination", "nomenclature")
+    if any(any(k in str(c).lower() for k in _name_like) for c in df.columns):
+        return df
+    best, best_metric = None, 0.0
+    for c in auto:
+        vals = [str(v).strip() for v in df[c] if str(v).strip()]
+        if not vals:
+            continue
+        texty = sum(1 for v in vals if re.search(r"[A-Za-z]", v)) / len(vals)
+        avglen = sum(len(v) for v in vals) / len(vals)
+        if texty >= 0.6 and avglen >= 4:
+            metric = texty * avglen
+            if metric > best_metric:
+                best, best_metric = c, metric
+    if best is not None and "Description" not in df.columns:
+        df = df.rename(columns={best: "Description"})
+    return df
 
 
 def _tesseract_page_to_df(mu_page: "fitz.Page") -> tuple[pd.DataFrame, str]:
@@ -734,6 +785,12 @@ def extract_pdf(
     min_text_chars = int(opts.get("min_text_chars_per_page", 20))
     enable_ocr = bool(opts.get("enable_ocr", True))
     ocr_ok = enable_ocr and _ocr_available()
+    # record WHY ocr is/isn't usable so the caller can warn accurately
+    if not enable_ocr:
+        result.ocr_status = "disabled"
+    elif not _ocr_available():
+        result.ocr_status = "unavailable"
+    # else left as the default; set to "ran" the first time we OCR a page
     score_confident = float(opts.get("score_confident", 18.0))
     plate_re = re.compile(opts.get("plate_number_regex", r"\b\d{3,4}-\d{3,4}-\d{2,4}\b"))
     skip_markers = [m.lower() for m in opts.get("skip_page_markers", [])]
@@ -769,6 +826,7 @@ def extract_pdf(
                             f"page {page_no}: scanned/image-only (no text layer)"
                         )
                         continue
+                    result.ocr_status = "ran"
                     df, method = _ocr_page_to_df(mu_page)
                     result.ocr_used = result.ocr_used or (not df.empty)
                     if df.empty:

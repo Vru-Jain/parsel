@@ -33,7 +33,8 @@
       "Name Type Dimension",
       "Item Designation",
       "Parts",
-      "Part"
+      "Part",
+      "Part Description"
     ],
     "Spare Group": [
       "Title",

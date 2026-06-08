@@ -10,9 +10,13 @@ cd spare_parts_parser
 pip install -r requirements.txt
 pip install pytest                 # if not already installed
 
-python -m pytest -m "not slow"     # fast unit/integration  (~10s, 91 tests)
+python -m pytest -m "not slow"     # fast unit/integration
 python -m pytest -m "slow"         # real-PDF integration (Book 1 section)
-python -m pytest                   # everything (95 tests, ~45s)
+python -m pytest                   # everything (117 tests)
+
+# `slow` / `requires_demo` tests need the real demo documents — point
+# PARSEL_DEMO_DIR at your local copy (they skip cleanly if it's unset/missing):
+#   $env:PARSEL_DEMO_DIR = "C:\path\to\Spare parts documents"
 ```
 
 ## What the demo documents told us (and what we changed)
@@ -85,7 +89,7 @@ to `tests/data/golden_aliases.json` and asserted in `test_semantic_mapper.py`.
 ## Generate a real demo artifact
 
 ```powershell
-python scripts/generate_demo_output.py "C:\Users\vrush\Downloads\Spare parts documents\Book 1.pdf"
+python scripts/generate_demo_output.py "<path to your manual>.pdf"
 ```
 
 Produces `Book 1_PROCESSED.xlsx` with the exact 14-column schema, ready to show.

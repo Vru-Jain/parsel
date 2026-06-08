@@ -1,1 +1,16 @@
 .venv/
+
+# Compiled bytecode — platform/version-specific, churns every commit
+__pycache__/
+*.pyc
+
+# Runtime-generated artifacts (recreated on first launch; contain real
+# processed-document filenames and run history — must not be committed)
+WIP_Tracker.txt
+parsel.log
+*_PROCESSED.xlsx
+*_QC_Report.csv
+
+# PyInstaller build output
+build/
+dist/

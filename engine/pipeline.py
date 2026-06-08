@@ -111,11 +111,19 @@ def process_file(
     if extraction.scanned_pages:
         n_scan = len(extraction.scanned_pages)
         if extraction.is_scanned and not extraction.ocr_used:
+            status = getattr(extraction, "ocr_status", "ran")
+            if status == "disabled":
+                reason = ("OCR is turned OFF in config.json (options.enable_ocr = "
+                          "false) — turn it on to read scanned pages.")
+            elif status == "unavailable":
+                reason = ("the OCR engine isn't installed — run "
+                          "'pip install rapidocr-onnxruntime' in the app's venv.")
+            else:  # "ran"
+                reason = ("OCR ran but couldn't read a parts table from them — they "
+                          "may be drawing/caution pages, or the scan is too faint.")
             result.warnings.append(
                 f"This PDF appears to be SCANNED (image-only): {n_scan} of "
-                f"{extraction.total_pages} pages have no text layer, and OCR did not "
-                f"read a parts table from them (they may be caution/diagram pages, or "
-                f"OCR is turned off in config)."
+                f"{extraction.total_pages} pages have no text layer, and {reason}"
             )
         elif extraction.ocr_used:
             result.warnings.append(

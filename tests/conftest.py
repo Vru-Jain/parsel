@@ -19,7 +19,13 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 # Folder with the real demo documents (manual, target xlsx, mapping docx).
-DEMO_DIR = r"C:\Users\vrush\Downloads\Spare parts documents"
+# Not part of the repo (real customer manuals) — point PARSEL_DEMO_DIR at your
+# local copy to enable the `slow`/`requires_demo` tests; they skip cleanly
+# otherwise. Falls back to a conventional per-user location.
+DEMO_DIR = os.environ.get(
+    "PARSEL_DEMO_DIR",
+    os.path.join(os.path.expanduser("~"), "Downloads", "Spare parts documents"),
+)
 DEMO_FILES = {
     "manual_scanned": os.path.join(DEMO_DIR, "05 1.pdf"),
     "manual_digital": os.path.join(DEMO_DIR, "Book 1.pdf"),

@@ -56,8 +56,10 @@ Output: **`dist\Parsel\Parsel.exe`**
 - An **editable `config.json`** is placed next to the .exe (not frozen inside),
   so business rules can be tweaked after compilation.
 - `--onedir` + `--windowed`: no console window, fast startup, AV-friendly.
-- The offline model (`./models`) and the OCR engine are bundled, so the target
-  machine needs **nothing installed** — not even Python.
+- The OCR engine (RapidOCR — ONNX models ship inside its wheel) is bundled, so
+  the target machine needs **nothing installed** — not even Python. There is
+  no separate model directory: column mapping is exact + fuzzy (deterministic,
+  no ML model to bundle or download).
 
 ---
 
@@ -67,11 +69,18 @@ Output: **`dist\Parsel\Parsel.exe`**
 PDF ─▶ pdf_extractor ─▶ semantic_mapper ─▶ transformer ─▶ qc_validator ─▶ Excel
         PyMuPDF +         exact → fuzzy       regex/          lang opt,
         OCR if scanned    (instant)           pandas          QC report
+                │
+                ▼
+        Preview window (review before saving; pick pages first if you like)
 ```
 
 - **pdf_extractor** — text-block reconstruction → PyMuPDF table finder, scored by
   header quality (best pass wins). Scanned pages are detected and run through
   **built-in OCR** (RapidOCR), with table rows/columns rebuilt from word boxes.
+  Optional **page selection** (`"1-5, 12, 20-30"`) lets the user point the
+  parser at exactly the pages that hold spare-parts tables. A reconciliation
+  check independently counts item-numbers per page and flags any page where
+  more were seen than rows extracted, so silent row loss is visible, not silent.
   Never returns silently empty; per-page errors are collected, not fatal.
 - **semantic_mapper** — 2-tier cascade (exact alias match → fuzzy edit-distance).
   Instant, no ML model. Unmapped columns are **preserved**, never dropped.
@@ -79,6 +88,10 @@ PDF ─▶ pdf_extractor ─▶ semantic_mapper ─▶ transformer ─▶ qc_val
   material tagging (`Matl.` prefix or → Internal Remark), null padding to schema.
 - **qc_validator** — optional language flag, `WIP_Tracker.txt` log, and a
   `<name>_QC_Report.csv` for rows missing key fields.
+- **Preview window** — processing fills the result tables in memory and writes
+  nothing; a preview dialog shows the exact "Spare Parts" / "Unmapped (review)"
+  sheets and the save path *before* anything touches disk. Excel is written
+  only when the user clicks Save.
 
 ## Configuration
 
@@ -108,6 +121,7 @@ spare_parts_parser/
 │  └─ pipeline.py       orchestration (locked-file safe)
 ├─ ui/
 │  ├─ main_window.py    dashboard + QThread worker + drag/drop + onboarding
+│  ├─ preview_dialog.py review table + save-path display before writing Excel
 │  ├─ settings_dialog.py 3-tab visual config editor
 │  ├─ theme.py          light Fusion theme + onboarding copy
 │  └─ icon.py           runtime-generated serpent logo + splash
