@@ -43,6 +43,23 @@ def _ensure_std_streams() -> None:
 
 _ensure_std_streams()
 
+# Load onnxruntime's native extension BEFORE PySide6/Qt initializes.
+#
+# onnxruntime (the engine behind the bundled RapidOCR) ships its own native
+# DLLs. If Qt loads its bundled copies of the same shared runtimes first,
+# `import onnxruntime` later fails with "DLL load failed while importing
+# onnxruntime_pybind11_state: A dynamic link library (DLL) initialization
+# routine failed" — the same class of DLL-load-order conflict that pushed us
+# to drop torch/sentence-transformers (see README). Because OCR is loaded
+# lazily on the worker thread during processing, that failure was getting
+# silently swallowed: the engine cached itself as unusable for the rest of
+# the run, and every scanned page quietly produced an empty table. Importing
+# onnxruntime here — before Qt — fixes the load order for the whole process.
+try:
+    import onnxruntime  # noqa: F401
+except Exception:
+    pass  # not installed / Tesseract fallback path handles OCR from here
+
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QColor
 
