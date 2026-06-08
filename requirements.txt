@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Offline Spare Parts Manual Parser - dependencies
+# 100% offline after first-run model download. No LLM / generative API calls.
+# ---------------------------------------------------------------------------
+
+PySide6==6.7.2          # GUI framework
+
+# --- PDF extraction (PyMuPDF only — no Ghostscript, no OpenCV, no pdfplumber) ---
+# pdfplumber was removed on purpose: it added nothing on these manuals yet
+# pdfplumber.open() could take ~13 min on some files (e.g. Book 1.pdf).
+PyMuPDF==1.24.10        # text/coords table finder + header/footer context
+
+# --- Column mapping (deterministic, offline, instant) ---
+rapidfuzz==3.9.7        # exact + fuzzy header matching (edit distance)
+# NOTE: sentence-transformers / torch were removed — on the real manuals the
+# semantic tier produced identical mappings to exact+fuzzy while adding ~1 GB,
+# ~18s startup, and a torch/Qt DLL conflict. See README.
+
+# --- Built-in OCR for scanned / image-only manuals (e.g. "05 1.pdf") ---
+# RapidOCR ships its ONNX models INSIDE the wheel: no Tesseract, no system
+# binary, runs offline on CPU. Pulls onnxruntime + opencv (headless math only).
+rapidocr-onnxruntime==1.4.4
+
+# --- Data + export ---
+pandas==2.2.2
+openpyxl==3.1.5
+
+# --- Packaging ---
+pyinstaller==6.10.0
+
+# --- OPTIONAL: Tesseract fallback (only used if RapidOCR is unavailable) ---
+# Requires the Tesseract binary installed separately:
+#   https://github.com/UB-Mannheim/tesseract/wiki  (Windows installer)
+pytesseract==0.3.13
+Pillow==10.4.0
+
+# NOTE (removed vs. original spec, on purpose):
+#   pdfplumber      -> pdfplumber.open() took ~13 min on Book 1.pdf; PyMuPDF
+#                      gives the same/better result in seconds
+#   camelot-py[cv]  -> requires Ghostscript (silent failures on Windows, GPL)
+#   langdetect      -> unreliable on short part-name strings; now optional
+# NOTE: opencv-python now comes in transitively via rapidocr-onnxruntime (used
+#   only for OCR image math, not GUI) — that's why it's no longer excluded.
