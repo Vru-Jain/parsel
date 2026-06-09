@@ -2,6 +2,7 @@
   "target_schema": [
     "Part Name",
     "Measuring Unit",
+    "Quantity",
     "Spare Group",
     "DrawingNo",
     "DrawingPosNo",
@@ -84,7 +85,12 @@
       "Ref",
       "Ref.",
       "Index",
-      "PIE0F No."
+      "PIE0F No.",
+      "BUBL",
+      "Bubble",
+      "Bubble No.",
+      "BUB",
+      "REF. NO."
     ],
     "Spare Part No": [
       "Part No.",
@@ -101,6 +107,8 @@
       "Article No.",
       "Article no.",
       "Article",
+      "ARTICLENO.",
+      "ARTICLE NO.",
       "ID No.",
       "Item ID.",
       "Standard No.",
@@ -148,6 +156,19 @@
       "U/M",
       "Measure",
       "Qty Unit"
+    ],
+    "Quantity": [
+      "Q'TY",
+      "QTY",
+      "Qty",
+      "Qty.",
+      "QT",
+      "Amount",
+      "QTY U/M",
+      "Spare",
+      "SPARE",
+      "QUA-",
+      "TITY QUA-"
     ],
     "Manufacturer": [
       "Maker",

@@ -85,6 +85,9 @@ class Transformer:
         out = self._extract_dimensions(out)
         out = self._tag_materials(out)
 
+        # ---- Step 3b: stitch continuation rows (wrapped descriptions)
+        out = self._stitch_continuation_rows(out)
+
         # ---- Step 4: null padding + column order (schema first, unmapped after)
         out = self._pad_and_order(out)
 
@@ -285,6 +288,44 @@ class Transformer:
                 new_part.append(str(row.get("Part Name", "")))
         df["Part Name"] = new_part
         df["Internal Remark"] = new_remark
+        return df
+
+    # ---- Step 3b --------------------------------------------------------- #
+    def _stitch_continuation_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Append continuation rows (wrapped descriptions) to the row above.
+
+        Engineering manuals frequently let a part name overflow into the next
+        row. These continuation rows have an empty DrawingPosNo (no item number)
+        but carry text in the Part Name column. Appending them fixes broken
+        multi-line descriptions without creating spurious extra rows.
+        """
+        if df.empty:
+            return df
+        if "DrawingPosNo" not in df.columns or "Part Name" not in df.columns:
+            return df
+
+        drop_idx = []
+        prev_valid = None
+        for idx in df.index:
+            key = str(df.at[idx, "DrawingPosNo"]).strip()
+            name = str(df.at[idx, "Part Name"]).strip()
+            if not key and name and prev_valid is not None:
+                prev_key = str(df.at[prev_valid, "DrawingPosNo"]).strip()
+                # Only stitch when the preceding row has a valid primary key.
+                # If the preceding row is also keyless (broken table / garbled
+                # column names), stitching cascades and loses rows.
+                if prev_key:
+                    prev = str(df.at[prev_valid, "Part Name"]).strip()
+                    df.at[prev_valid, "Part Name"] = (prev + " " + name).strip()
+                    drop_idx.append(idx)
+                else:
+                    prev_valid = idx
+            else:
+                prev_valid = idx
+
+        if drop_idx:
+            df = df.drop(index=drop_idx).reset_index(drop=True)
         return df
 
     # ---- Step 4 ------------------------------------------------------- #

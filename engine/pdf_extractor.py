@@ -447,6 +447,45 @@ _OCR_ROW_SKIP_PREFIXES = (
     "instruction", "please", "do not", "important", "remark",
 )
 
+# Prepositions/articles that only make sense as part of a multi-word column
+# header (e.g. OCR splits "NAME OF PART" into three separate boxes wide enough
+# apart that they form distinct column centers → phantom "OF" column).
+_OCR_COL_STOPWORDS = {
+    "of", "in", "by", "at", "to", "for", "and", "or", "the", "a", "an", "with",
+}
+
+
+def _find_header_by_onset(rows: list, current_best: int) -> int:
+    """
+    Data-onset anchoring: verify or improve the header-row index by locating the
+    first onset of sequential item numbers (two consecutive rows each carrying a
+    short integer token). The header is the last row with ≥2 recognized header
+    tokens just above that onset.
+
+    Returns current_best unchanged when no better candidate is identified — this
+    is purely additive and never degrades an already-good detection.
+    """
+    int_rows = [
+        ri for ri, row in enumerate(rows)
+        if any(re.fullmatch(r"\d{1,4}[A-Za-z]?", c["t"].strip()) for c in row)
+    ]
+    if len(int_rows) < 2:
+        return current_best
+    # Find the first pair of integer-carrying rows within 3 rows of each other.
+    onset = None
+    for k in range(len(int_rows) - 1):
+        if int_rows[k + 1] - int_rows[k] <= 3:
+            onset = int_rows[k]
+            break
+    if onset is None or onset == 0:
+        return current_best
+    # Walk up from the onset to find the nearest row with ≥2 header tokens.
+    for back in range(onset - 1, max(-1, onset - 6), -1):
+        sc = sum(1 for c in rows[back] if _norm_header(c["t"]) in _OCR_HEADER_TOKENS)
+        if sc >= 2:
+            return back
+    return current_best
+
 
 def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
     """Reconstruct a table from RapidOCR boxes: cluster cells into rows (by y),
@@ -498,6 +537,11 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
     if best_score < 2:
         return pd.DataFrame()
 
+    # Data-onset refinement: verify the token-based header against the actual
+    # start of sequential integer item numbers.  Only replaces best_i when a
+    # better-scored header row is found just above the integer onset.
+    best_i = _find_header_by_onset(rows, best_i)
+
     # ---- cluster columns by x using only the table region (header + below) ----
     if best_i == len(rows) - 1:
         # Header is the last row — nothing beneath it; treat as no parseable table.
@@ -542,6 +586,63 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
             seen[nm] = 0
         colnames.append(nm)
 
+    # ---- Merge orphan stop-word columns into adjacent neighbors --------------
+    # OCR sometimes places each word of a multi-word column header ("NAME OF
+    # PART") in a separate bounding box far enough apart that they form distinct
+    # column centers, producing phantom "OF" or "IN" columns.
+    #
+    # Strategy: when a column whose entire header is a preposition/article is
+    # SANDWICHED between two content columns (both > 3 chars, neither a stop
+    # word), absorb left, center, and right into one group in a single step.
+    # This handles "NAME | OF | PART" → "NAME OF PART" without mistakenly
+    # merging unrelated adjacent columns.  Edge-case stop words (leftmost or
+    # rightmost) are merged with whichever neighbor exists.
+    col_groups: list[list[int]] = [[i] for i in range(ncol)]
+    cg_names: list[str] = list(colnames)
+    ci = 0
+    while ci < len(col_groups):
+        nm = cg_names[ci].strip().lower()
+        if nm in _OCR_COL_STOPWORDS:
+            left_ok = (ci > 0
+                       and len(cg_names[ci - 1].strip()) > 3
+                       and cg_names[ci - 1].strip().lower() not in _OCR_COL_STOPWORDS)
+            right_ok = (ci + 1 < len(col_groups)
+                        and len(cg_names[ci + 1].strip()) > 3
+                        and cg_names[ci + 1].strip().lower() not in _OCR_COL_STOPWORDS)
+            if left_ok and right_ok:
+                # sandwich: absorb stop word AND right neighbor into left group
+                col_groups[ci - 1].extend(col_groups[ci])
+                col_groups[ci - 1].extend(col_groups[ci + 1])
+                cg_names[ci - 1] = (
+                    cg_names[ci - 1] + " " + cg_names[ci] + " " + cg_names[ci + 1]
+                ).strip()
+                col_groups.pop(ci + 1); cg_names.pop(ci + 1)  # pop right first
+                col_groups.pop(ci);     cg_names.pop(ci)        # then stop word
+                # ci stays: may be another stop word to process at the same index
+            elif ci > 0:
+                col_groups[ci - 1].extend(col_groups[ci])
+                cg_names[ci - 1] = (cg_names[ci - 1] + " " + cg_names[ci]).strip()
+                col_groups.pop(ci); cg_names.pop(ci)
+            elif ci + 1 < len(col_groups):
+                col_groups[ci + 1] = col_groups[ci] + col_groups[ci + 1]
+                cg_names[ci + 1] = (cg_names[ci] + " " + cg_names[ci + 1]).strip()
+                col_groups.pop(ci); cg_names.pop(ci)
+            else:
+                ci += 1
+        else:
+            ci += 1
+    ngrp = len(col_groups)
+    colnames, seen = [], {}
+    for nm in cg_names:
+        nm = nm or f"col{len(colnames)}"
+        if nm in seen:
+            seen[nm] += 1
+            nm = f"{nm}_{seen[nm]}"
+        else:
+            seen[nm] = 0
+        colnames.append(nm)
+    # --------------------------------------------------------------------------
+
     # Compute row centre-y values for gap detection.  A gap wider than
     # 5 × median cell height indicates a footer/letterhead block separated from
     # the data (common in landscape manuals after a 90° rotation pass).
@@ -555,7 +656,10 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
         if cur_y - prev_y > gap_limit:
             break   # large gap → letterhead / footer block; stop here
         prev_y = cur_y
-        cells = [g.get(i, "").strip() for i in range(ncol)]
+        cells = [
+            " ".join(g.get(oi, "").strip() for oi in grp).strip()
+            for grp in col_groups
+        ]
         nonempty = [c for c in cells if c]
         if not nonempty:
             continue
@@ -568,7 +672,7 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
         # drop caution / instruction / note prose
         if any(c.startswith(_OCR_ROW_SKIP_PREFIXES) for c in low):
             continue
-        records.append({colnames[i]: cells[i] for i in range(ncol)})
+        records.append({colnames[k]: cells[k] for k in range(ngrp)})
 
     # --- inverted-table pass -----------------------------------------------
     # Some engineering drawing sheets print a reference parts table with data
@@ -623,6 +727,50 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
                     _iseen[_n] = 0
                 _inm.append(_n)
 
+            # Merge stop-word columns in the inverted pass (sandwich, same as main pass)
+            _icg: list = [[_j] for _j in range(_inc)]
+            _icgn: list = list(_inm)
+            _ij = 0
+            while _ij < len(_icg):
+                _inm_word = _icgn[_ij].strip().lower()
+                if _inm_word in _OCR_COL_STOPWORDS:
+                    _ileft = (_ij > 0
+                              and len(_icgn[_ij - 1].strip()) > 3
+                              and _icgn[_ij - 1].strip().lower() not in _OCR_COL_STOPWORDS)
+                    _iright = (_ij + 1 < len(_icg)
+                               and len(_icgn[_ij + 1].strip()) > 3
+                               and _icgn[_ij + 1].strip().lower() not in _OCR_COL_STOPWORDS)
+                    if _ileft and _iright:
+                        _icg[_ij - 1].extend(_icg[_ij])
+                        _icg[_ij - 1].extend(_icg[_ij + 1])
+                        _icgn[_ij - 1] = (
+                            _icgn[_ij - 1] + " " + _icgn[_ij] + " " + _icgn[_ij + 1]
+                        ).strip()
+                        _icg.pop(_ij + 1); _icgn.pop(_ij + 1)
+                        _icg.pop(_ij);     _icgn.pop(_ij)
+                    elif _ij > 0:
+                        _icg[_ij - 1].extend(_icg[_ij])
+                        _icgn[_ij - 1] = (_icgn[_ij - 1] + " " + _icgn[_ij]).strip()
+                        _icg.pop(_ij); _icgn.pop(_ij)
+                    elif _ij + 1 < len(_icg):
+                        _icg[_ij + 1] = _icg[_ij] + _icg[_ij + 1]
+                        _icgn[_ij + 1] = (_icgn[_ij] + " " + _icgn[_ij + 1]).strip()
+                        _icg.pop(_ij); _icgn.pop(_ij)
+                    else:
+                        _ij += 1
+                else:
+                    _ij += 1
+            _ingrp = len(_icg)
+            _inm = []
+            _inseen: dict = {}
+            for _nn in _icgn:
+                _nn = _nn or f"col{len(_inm)}"
+                if _nn in _inseen:
+                    _inseen[_nn] += 1; _nn = f"{_nn}_{_inseen[_nn]}"
+                else:
+                    _inseen[_nn] = 0
+                _inm.append(_nn)
+
             _irecs: list = []
             _ipy = region_ys[0]
             for _irow in reversed(rows[:best_i]):
@@ -637,7 +785,10 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
                 for _c in sorted(_ir, key=lambda c: c["cx"]):
                     _ci = _icol(_c["cx"])
                     _ib[_ci] = (_ib.get(_ci, "") + " " + _c["t"]).strip()
-                _ic = [_ib.get(_k, "").strip() for _k in range(_inc)]
+                _ic = [
+                    " ".join(_ib.get(_ok, "").strip() for _ok in _og).strip()
+                    for _og in _icg
+                ]
                 _ine = [_v for _v in _ic if _v]
                 if not _ine:
                     continue
@@ -647,10 +798,13 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
                     continue
                 if any(_v.startswith(_OCR_ROW_SKIP_PREFIXES) for _v in _il):
                     continue
-                _irecs.append({_inm[_k]: _ic[_k] for _k in range(_inc)})
+                _irecs.append({_inm[_k]: _ic[_k] for _k in range(_ingrp)})
 
             if _irecs:
-                _ino_name = _inm[_no_idx] if _no_idx < len(_inm) else ""
+                # Use token search so the index is valid after the stop-word merge
+                _ino_name = next(
+                    (nm for nm in _inm if _norm_header(nm) in _NO_COL_TOKENS), ""
+                )
                 _ino_frac = sum(
                     1 for _r in _irecs
                     if str(_r.get(_ino_name, "")).strip().isdigit()
