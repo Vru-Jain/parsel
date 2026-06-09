@@ -111,7 +111,7 @@ def process_file(
     if extraction.scanned_pages:
         n_scan = len(extraction.scanned_pages)
         if extraction.is_scanned and not extraction.ocr_used:
-            status = getattr(extraction, "ocr_status", "ran")
+            status = getattr(extraction, "ocr_status", "not_needed")
             if status == "disabled":
                 reason = ("OCR is turned OFF in config.json (options.enable_ocr = "
                           "false) — turn it on to read scanned pages.")

@@ -10,6 +10,7 @@ plus the "Unmapped (review)" sheet if any), then clicks "Save Excel" to write it
 from __future__ import annotations
 
 import os
+import sys
 
 import pandas as pd
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
@@ -79,7 +80,7 @@ class PreviewDialog(QDialog):
         self.results = [(n, r) for n, r in results if r.main_df is not None]
         self.saved_paths: list[str] = []
         self.setWindowTitle("Preview — review before saving")
-        self.resize(960, 620)
+        self.resize(960, 640)
         self._build_ui()
         if self.results:
             self._show_file(0)
@@ -102,20 +103,31 @@ class PreviewDialog(QDialog):
         self.summary.setWordWrap(True)
         root.addWidget(self.summary)
 
-        # show exactly where the .xlsx will be written
+        # Show where the .xlsx will be written (updated to actual path after save)
         self.path_label = QLabel("")
         self.path_label.setWordWrap(True)
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.path_label.setStyleSheet("color:#15663f;")
         root.addWidget(self.path_label)
 
+        # Amber banner: shown when any column couldn't be mapped — lets the user
+        # act on the issue while still in the preview, before committing to save.
+        self.unmapped_banner = QLabel("")
+        self.unmapped_banner.setWordWrap(True)
+        self.unmapped_banner.setStyleSheet(
+            "background:#fffbeb; color:#92400e;"
+            " border:1px solid #f59e0b; border-radius:6px; padding:6px 10px;"
+        )
+        self.unmapped_banner.setVisible(False)
+        root.addWidget(self.unmapped_banner)
+
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, stretch=1)
 
         hint = QLabel(
-            "This is exactly what will be written. Nothing is saved until you "
-            "click “Save Excel”. Wrong columns? Close, fix in Settings ▸ "
-            "Mappings, and re-process."
+            'This is exactly what will be written. Nothing is saved until you '
+            'click "Save Excel". Wrong columns? Close, fix in Settings ▸ '
+            'Mappings, and re-process.'
         )
         hint.setObjectName("caption")
         hint.setWordWrap(True)
@@ -123,12 +135,16 @@ class PreviewDialog(QDialog):
 
         btns = QHBoxLayout()
         btns.addStretch(1)
+        self.show_folder_btn = QPushButton("📁 Show in Folder")
+        self.show_folder_btn.clicked.connect(self._open_saved_folder)
+        self.show_folder_btn.setVisible(False)
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.reject)
         self.save_btn = QPushButton("💾 Save Excel")
         self.save_btn.setObjectName("primaryButton")
         self.save_btn.setDefault(True)
         self.save_btn.clicked.connect(self._save_all)
+        btns.addWidget(self.show_folder_btn)
         btns.addWidget(self.close_btn)
         btns.addWidget(self.save_btn)
         root.addLayout(btns)
@@ -144,16 +160,42 @@ class PreviewDialog(QDialog):
         if res.unmapped_df is not None and not res.unmapped_df.empty:
             self.tabs.addTab(_make_table(res.unmapped_df),
                              f"Unmapped (review)  ({len(res.unmapped_df)})")
+
         bits = [f"{res.rows} rows"]
         if res.unmapped:
             bits.append(f"{len(res.unmapped)} unmapped column(s)")
         if res.warnings:
             bits.append(f"{len(res.warnings)} warning(s)")
+        if res.page_errors:
+            bits.append(f"{len(res.page_errors)} page issue(s)")
         self.summary.setText(" · ".join(bits))
+
+        # Unmapped banner: visible only when the current file has unmapped columns.
+        if res.unmapped:
+            self.unmapped_banner.setText(
+                f"⚠  {len(res.unmapped)} column(s) couldn't be mapped: "
+                f"{', '.join(res.unmapped)}  — fix in Settings ▸ Mappings "
+                f"and re-process."
+            )
+            self.unmapped_banner.setVisible(True)
+        else:
+            self.unmapped_banner.setVisible(False)
+
         self._update_path_label()
 
-    def _update_path_label(self):
-        """Show where the Excel file(s) will be written."""
+    def _update_path_label(self, saved_path: str | None = None):
+        """Show the actual saved path after a successful save, or the
+        estimated destination before."""
+        if saved_path:
+            if len(self.saved_paths) == 1:
+                self.path_label.setText(f"✔ Saved to:  {saved_path}")
+            else:
+                folder = os.path.dirname(saved_path) or "."
+                self.path_label.setText(
+                    f"✔ Saved {len(self.saved_paths)} file(s) to: {folder}")
+            self.path_label.setStyleSheet("color:#0a7c3c; font-weight:600;")
+            return
+
         if not self.results:
             self.path_label.setText("")
             return
@@ -167,6 +209,7 @@ class PreviewDialog(QDialog):
             where = next(iter(dirs)) if len(dirs) == 1 else "each PDF's own folder"
             self.path_label.setText(
                 f"💾 Will save {len(self.results)} files (one per PDF) to: {where}")
+        self.path_label.setStyleSheet("color:#15663f;")
 
     # ------------------------------------------------------------------ #
     def _save_all(self):
@@ -177,7 +220,10 @@ class PreviewDialog(QDialog):
                 path = write_excel_file(res, out_dir)
                 saved.append(path)
             except ExcelLockedError as exc:
-                failed.append(f"{name}: open in Excel ({os.path.basename(str(exc))}) — close it and retry")
+                failed.append(
+                    f"{name}: open in Excel ({os.path.basename(str(exc))}) "
+                    f"— close it and retry"
+                )
             except Exception as exc:
                 failed.append(f"{name}: {exc}")
 
@@ -186,9 +232,36 @@ class PreviewDialog(QDialog):
             QMessageBox.warning(
                 self, "Some files not saved",
                 "Saved {} of {} file(s).\n\nProblems:\n{}".format(
-                    len(saved), len(self.results), "\n".join(f"• {f}" for f in failed)),
+                    len(saved), len(self.results),
+                    "\n".join(f"• {f}" for f in failed)),
             )
             if not saved:
                 return
+
         if saved:
-            self.accept()
+            # Update path label with the actual saved location, reveal the
+            # "Show in Folder" shortcut, disable Save so it can't be double-clicked,
+            # and turn the close button into a "Done" confirm.
+            self._update_path_label(saved[-1])
+            self.show_folder_btn.setVisible(True)
+            self.save_btn.setEnabled(False)
+            self.close_btn.setText("Done")
+            try:
+                self.close_btn.clicked.disconnect()
+            except RuntimeError:
+                pass
+            self.close_btn.clicked.connect(self.accept)
+
+    def _open_saved_folder(self):
+        if not self.saved_paths:
+            return
+        folder = os.path.dirname(self.saved_paths[-1]) or "."
+        try:
+            if os.name == "nt":
+                os.startfile(folder)  # noqa: S606
+            else:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                import subprocess
+                subprocess.Popen([opener, folder])
+        except Exception:
+            pass

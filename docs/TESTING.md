@@ -32,6 +32,15 @@ Analyzing the real files surfaced issues that would have **broken the live demo*
 
 These four were caught **before** the demo, by the tests.
 
+### Post-code-review fixes (applied after `/code-review` audit)
+
+| Finding | Location | Impact | Fix |
+|---|---|---|---|
+| `ocr_status = "ran"` set **before** the OCR call | `pdf_extractor.py` | If the RapidOCR engine silently failed to initialize, every scanned page got `ocr_status = "ran"` even though no OCR ran — the user saw "OCR ran but couldn't read a parts table" instead of "engine unavailable" | Moved the assignment to **after** the call; checks `_RAPIDOCR is None` to detect silent init failures and update status to `"unavailable"`, surfacing the actual exception message in warnings |
+| `getattr(extraction, "ocr_status", "ran")` — wrong fallback | `pipeline.py` | If `ocr_status` were ever absent, the default `"ran"` would misdirect the user to the wrong warning message | Changed fallback to `"not_needed"` (the dataclass default) |
+| Secondary header filter dropped real data rows | `pdf_extractor.py` | Token set includes `"code"`, `"type"`, `"unit"` — common real data values in marine parts lists; threshold of 2 was too aggressive | Raised threshold from `>= 2` to `>= 3` |
+| Regression test `test_title_block_does_not_bridge_columns` did not discriminate old vs new code | `test_pdf_extractor.py` | The original title-block geometry didn't actually bridge any column gap with the old clustering, so the test passed even before the fix — a real regression would have gone undetected | Replaced with a case (cx=130/160 title block, colgap=40) that the old whole-page clustering collapses to one column but table-region-only clustering correctly separates |
+
 ### Output-quality fixes (found by generating a real Excel from `Book 1.pdf`)
 
 | Problem in first real output | Fix |
@@ -70,7 +79,7 @@ to `tests/data/golden_aliases.json` and asserted in `test_semantic_mapper.py`.
 | `test_transformer.py` | Every checklist rule: proper case, conjunction lowercase, `L=`/`Dia.` dimensions, `Matl.` prefix vs Internal Remark, null padding, schema order, unmapped-column preservation, context stamping |
 | `test_semantic_mapper.py` | Exact / fuzzy 2-tier cascade; all 92 golden aliases; ambiguity handling; internal-column skipping |
 | `test_qc_validator.py` | WIP_Tracker format, QC-report CSV for missing key fields, language-flag off-by-default + short-string guard |
-| `test_pdf_extractor.py` | Header **scoring** (clean beats garbage), row→DataFrame (blank/dup/ragged headers), known-header index |
+| `test_pdf_extractor.py` | Header **scoring** (clean beats garbage), row→DataFrame (blank/dup/ragged headers), known-header index, page-spec parsing, text-block item/designation parser, OCR table reconstruction (box filtering, row/column clustering, title-block column isolation, unheadered-column rename) |
 | `test_pipeline.py` | Full extract→map→transform→QC→Excel on synthetic PDFs; corrupt PDF, scanned PDF, locked Excel, empty table; **output schema == target xlsx** |
 | `test_output_quality.py` | Noise-row removal, NaN handling, strict 14-col main sheet + separate unmapped sheet, section-title extraction via "Plate" locator, candidate filtering |
 | `test_real_documents.py` (`slow`) | The actual `Book 1.pdf` (clean headers, real part names map to schema) and `05 1.pdf` (detected as scanned), plus schema match vs `New Format (1) 2.xlsx` |

@@ -217,8 +217,9 @@ HELP_HTML = f"""
 
   <h3>If something looks off</h3>
   <ul>
-    <li><b>“Scanned / image-only”</b> message → the PDF is a picture, not text.
-        It can still be read if OCR is installed; otherwise ask your supervisor.</li>
+    <li><b>”Scanned / image-only”</b> message → the PDF is a picture, not text.
+        The app will automatically try to read it with its built-in OCR engine —
+        results are approximate and flagged for QC review.</li>
     <li><b>“Open in Excel” error</b> → close the Excel file first, then Process again.</li>
     <li><b>Only need part of a big manual?</b> Type page numbers in the <i>Pages</i> boxes
         (leave blank for the whole file).</li>

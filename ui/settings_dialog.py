@@ -50,8 +50,8 @@ class SettingsDialog(QDialog):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.addWidget(QLabel(
-            "Link an unmapped header (left) to a target schema column (right), "
-            "then click “Link”. This adds it to header_aliases."
+            'Link an unmapped header (left) to a target schema column (right), '
+            'then click "Link". This adds it to header_aliases.'
         ))
 
         body = QHBoxLayout()
@@ -90,11 +90,32 @@ class SettingsDialog(QDialog):
         raw = item.text()
         target = self.target_combo.currentText()
         aliases = self.config.setdefault("header_aliases", {})
+
+        # Check if this alias already lives under a DIFFERENT target.
+        existing_target = None
+        for t, bucket in aliases.items():
+            if t != target and raw in bucket:
+                existing_target = t
+                break
+
+        if existing_target is not None:
+            reply = QMessageBox.question(
+                self,
+                "Alias already mapped",
+                f'"{raw}" is already linked to "{existing_target}".\n\n'
+                f'Move it to "{target}" instead?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            # Remove from the old bucket before adding to the new one.
+            aliases[existing_target].remove(raw)
+
         bucket = aliases.setdefault(target, [])
         if raw not in bucket:
             bucket.append(raw)
-        self.alias_preview.setText(f"Linked “{raw}” → {target}")
-        # remove from the unmapped list so it isn't linked twice
+        self.alias_preview.setText(f'Linked "{raw}" → {target}')
+        # Remove from the unmapped list so it isn't linked twice.
         self.unmapped_list.takeItem(self.unmapped_list.row(item))
 
     # ------------------------------------------------------------------ #
@@ -170,11 +191,24 @@ class SettingsDialog(QDialog):
         self.max_mat = QSpinBox()
         self.max_mat.setRange(1, 100)
         self.max_mat.setValue(int(rules.get("max_material_length_for_prefix", 15)))
+        self.max_mat.setToolTip(
+            'Longest string (characters) to treat as a material prefix — e.g. '
+            '"Matl." or "SS316".\n'
+            'Increase if material codes are being cut short; decrease to avoid '
+            'pulling in long descriptions.\n'
+            'Scroll wheel to adjust.'
+        )
         form.addRow("Max material length for prefix:", self.max_mat)
 
         self.fuzzy = QSpinBox()
         self.fuzzy.setRange(50, 100)
         self.fuzzy.setValue(int(rules.get("fuzzy_threshold", 88)))
+        self.fuzzy.setToolTip(
+            "Minimum similarity score (50–100%) for fuzzy column-name matching.\n"
+            "Higher = stricter (fewer false links, more unmapped columns).\n"
+            "Lower = more aggressive (fewer unmapped, but risk of wrong mapping).\n"
+            "Default 88% works for most manuals. Scroll wheel to adjust."
+        )
         form.addRow("Fuzzy match threshold (%):", self.fuzzy)
 
         self.lang_toggle = QCheckBox("Enable foreign-language detection (Part Name)")

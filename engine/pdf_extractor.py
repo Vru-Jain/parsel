@@ -339,19 +339,21 @@ def _extract_pymupdf_page(mu_page: "fitz.Page") -> tuple[pd.DataFrame, str]:
 # optional fallback if someone has it installed.
 _RAPIDOCR = None
 _RAPIDOCR_TRIED = False
+_RAPIDOCR_ERROR = ""  # last init exception message; empty if not tried or succeeded
 
 
 def _get_rapidocr():
     """Lazy singleton. Loads the ONNX models once; returns engine or None."""
-    global _RAPIDOCR, _RAPIDOCR_TRIED
+    global _RAPIDOCR, _RAPIDOCR_TRIED, _RAPIDOCR_ERROR
     if _RAPIDOCR_TRIED:
         return _RAPIDOCR
     _RAPIDOCR_TRIED = True
     try:
         from rapidocr_onnxruntime import RapidOCR
         _RAPIDOCR = RapidOCR()
-    except Exception:
+    except Exception as exc:
         _RAPIDOCR = None
+        _RAPIDOCR_ERROR = str(exc)
     return _RAPIDOCR
 
 
@@ -409,7 +411,25 @@ def _rapidocr_page_to_df(mu_page: "fitz.Page", eng) -> pd.DataFrame:
         return pd.DataFrame()
     if not res:
         return pd.DataFrame()
-    return _boxes_to_table(res, pix.width)
+    df = _boxes_to_table(res, pix.width)
+    if not df.empty:
+        return df
+
+    # Rotation pass: some manuals are landscape A3/A4 documents scanned or
+    # printed into portrait pages. Rotating 90° CW restores the landscape
+    # reading orientation so _boxes_to_table can find the column header row.
+    # Only attempted when the upright pass yielded nothing — no OCR re-run
+    # needed, just numpy array rotation.
+    try:
+        img_cw = np.rot90(img, k=3)          # k=3 → 90° CW (270° CCW)
+        res_rot, _ = eng(np.ascontiguousarray(img_cw), use_cls=False)
+        if res_rot:
+            df_rot = _boxes_to_table(res_rot, img_cw.shape[1])
+            if not df_rot.empty:
+                return df_rot
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 
 # header tokens we expect on a parts page — used to find the header row
@@ -426,10 +446,6 @@ _OCR_ROW_SKIP_PREFIXES = (
     "caution", "warning", "danger", "notice", "note", "attention",
     "instruction", "please", "do not", "important", "remark",
 )
-
-
-def _norm_ocr(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
 def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
@@ -472,7 +488,7 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
     # known header token (checked per raw cell, BEFORE any column merge) ----
     best_i, best_score = -1, 0
     for ri, row in enumerate(rows):
-        sc = sum(1 for c in row if _norm_ocr(c["t"]) in _OCR_HEADER_TOKENS)
+        sc = sum(1 for c in row if _norm_header(c["t"]) in _OCR_HEADER_TOKENS)
         if sc > best_score:
             best_score, best_i = sc, ri
 
@@ -483,8 +499,15 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     # ---- cluster columns by x using only the table region (header + below) ----
+    if best_i == len(rows) - 1:
+        # Header is the last row — nothing beneath it; treat as no parseable table.
+        return pd.DataFrame()
     region_rows = rows[best_i:]
-    centers = sorted(c["cx"] for row in region_rows for c in row)
+    # Use header cells only for column clustering.  Using the full region
+    # (header + all below) lets data cells bridge the x-gaps between real
+    # columns when a spec/title block sits just below the parts header (common
+    # on engineering general-view sheets), collapsing multiple columns into one.
+    centers = sorted(c["cx"] for c in rows[best_i])
     colgap = max(40.0, page_w * 0.035)
     grp, colcenters = [centers[0]], []
     for x in centers[1:]:
@@ -519,20 +542,123 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
             seen[nm] = 0
         colnames.append(nm)
 
+    # Compute row centre-y values for gap detection.  A gap wider than
+    # 5 × median cell height indicates a footer/letterhead block separated from
+    # the data (common in landscape manuals after a 90° rotation pass).
+    region_ys = [sum(c["cy"] for c in rrow) / len(rrow) for rrow in region_rows]
+    gap_limit = 5.0 * hmed
+    prev_y = region_ys[0]  # header row y
+
     records = []
-    for g in data_rows:
+    for ri, g in enumerate(data_rows):
+        cur_y = region_ys[ri + 1]
+        if cur_y - prev_y > gap_limit:
+            break   # large gap → letterhead / footer block; stop here
+        prev_y = cur_y
         cells = [g.get(i, "").strip() for i in range(ncol)]
         nonempty = [c for c in cells if c]
         if not nonempty:
             continue
         low = [c.lower() for c in nonempty]
-        # drop a leaked secondary header row (e.g. the "TYPE / QT." band)
-        if sum(1 for c in low if _norm_ocr(c) in _OCR_HEADER_TOKENS) >= 2:
+        # Drop a leaked secondary header row (e.g. a repeated "TYPE / QT." band).
+        # Threshold is 3 to avoid false-drops: tokens like "code", "type", "unit"
+        # are common real data values in marine parts lists.
+        if sum(1 for c in low if _norm_header(c) in _OCR_HEADER_TOKENS) >= 3:
             continue
         # drop caution / instruction / note prose
         if any(c.startswith(_OCR_ROW_SKIP_PREFIXES) for c in low):
             continue
         records.append({colnames[i]: cells[i] for i in range(ncol)})
+
+    # --- inverted-table pass -----------------------------------------------
+    # Some engineering drawing sheets print a reference parts table with data
+    # rows ABOVE the column header and unrelated content (specs, title block)
+    # below.  Signal: the item-number column has very few integers in the rows
+    # extracted from below the header.  When triggered, re-extract using rows
+    # above best_i, filtered to the table's x-range so drawing labels are
+    # excluded.  Only replaces the normal result when numeric fraction is better.
+    _NO_COL_TOKENS = {"no", "item", "itemno", "ref", "refno"}
+    _no_idx = next(
+        (i for i, nm in enumerate(colnames)
+         if _norm_header(nm) in _NO_COL_TOKENS),
+        None,
+    )
+    if _no_idx is not None and records and best_i > 0:
+        _no_name = colnames[_no_idx]
+        _num_frac = sum(
+            1 for r in records
+            if str(r.get(_no_name, "")).strip().isdigit()
+        ) / len(records)
+        if _num_frac < 0.3:
+            # Build column centers from header cells only (same as main pass)
+            _hcxs = sorted(c["cx"] for c in rows[best_i])
+            _igap = max(40.0, page_w * 0.035)
+            _ig, _ics = [_hcxs[0]], []
+            for _x in _hcxs[1:]:
+                if _x - _ig[-1] <= _igap:
+                    _ig.append(_x)
+                else:
+                    _ics.append(sum(_ig) / len(_ig))
+                    _ig = [_x]
+            _ics.append(sum(_ig) / len(_ig))
+            _inc = len(_ics)
+            _ix_lo = _ics[0] - _igap * 2
+            _ix_hi = _ics[-1] + _igap * 2
+
+            def _icol(cx):
+                return min(range(_inc), key=lambda k: abs(cx - _ics[k]))
+
+            _ihdr: dict = {}
+            for _c in sorted(rows[best_i], key=lambda c: c["cx"]):
+                _ci = _icol(_c["cx"])
+                _ihdr[_ci] = (_ihdr.get(_ci, "") + " " + _c["t"]).strip()
+            _inm: list = []
+            _iseen: dict = {}
+            for _i in range(_inc):
+                _n = (_ihdr.get(_i, "") or f"col{_i}").strip() or f"col{_i}"
+                if _n in _iseen:
+                    _iseen[_n] += 1
+                    _n = f"{_n}_{_iseen[_n]}"
+                else:
+                    _iseen[_n] = 0
+                _inm.append(_n)
+
+            _irecs: list = []
+            _ipy = region_ys[0]
+            for _irow in reversed(rows[:best_i]):
+                _ir = [_c for _c in _irow if _ix_lo <= _c["cx"] <= _ix_hi]
+                if not _ir:
+                    continue
+                _icy = sum(_c["cy"] for _c in _ir) / len(_ir)
+                if _ipy - _icy > gap_limit:
+                    break
+                _ipy = _icy
+                _ib: dict = {}
+                for _c in sorted(_ir, key=lambda c: c["cx"]):
+                    _ci = _icol(_c["cx"])
+                    _ib[_ci] = (_ib.get(_ci, "") + " " + _c["t"]).strip()
+                _ic = [_ib.get(_k, "").strip() for _k in range(_inc)]
+                _ine = [_v for _v in _ic if _v]
+                if not _ine:
+                    continue
+                _il = [_v.lower() for _v in _ine]
+                if sum(1 for _v in _il
+                       if _norm_header(_v) in _OCR_HEADER_TOKENS) >= 3:
+                    continue
+                if any(_v.startswith(_OCR_ROW_SKIP_PREFIXES) for _v in _il):
+                    continue
+                _irecs.append({_inm[_k]: _ic[_k] for _k in range(_inc)})
+
+            if _irecs:
+                _ino_name = _inm[_no_idx] if _no_idx < len(_inm) else ""
+                _ino_frac = sum(
+                    1 for _r in _irecs
+                    if str(_r.get(_ino_name, "")).strip().isdigit()
+                ) / len(_irecs)
+                if _ino_frac > _num_frac:
+                    records = _irecs
+    # -----------------------------------------------------------------------
+
     if not records:
         return pd.DataFrame()
 
@@ -546,8 +672,9 @@ def _boxes_to_table(res, page_w: int) -> pd.DataFrame:
 
 def _name_description_column(df: pd.DataFrame) -> pd.DataFrame:
     """Rename a single auto-named ('colN') column to 'Description' when it holds
-    mostly alphabetic free text and is the widest such column — so it maps to
-    Part Name downstream instead of being dropped as unmapped."""
+    mostly alphabetic free text (texty >= 0.6, avglen >= 4) — so it maps to
+    Part Name downstream instead of being dropped as unmapped. Selection uses
+    texty * avglen as a content metric; column geometry is not measured."""
     auto = [c for c in df.columns if re.fullmatch(r"col\d+", str(c))]
     if not auto:
         return df
@@ -826,9 +953,22 @@ def extract_pdf(
                             f"page {page_no}: scanned/image-only (no text layer)"
                         )
                         continue
-                    result.ocr_status = "ran"
                     df, method = _ocr_page_to_df(mu_page)
                     result.ocr_used = result.ocr_used or (not df.empty)
+                    # Update ocr_status only on the first scanned-page attempt, and
+                    # only after we know whether the engine actually loaded. A bare
+                    # package-presence check (_ocr_available) cannot detect a silent
+                    # init failure — _RAPIDOCR_TRIED+_RAPIDOCR is the ground truth.
+                    if result.ocr_status != "ran":
+                        if _RAPIDOCR_TRIED and _RAPIDOCR is None and not _tesseract_available():
+                            result.ocr_status = "unavailable"
+                            if _RAPIDOCR_ERROR:
+                                result.page_errors.append(
+                                    f"OCR engine init failed: {_RAPIDOCR_ERROR}"
+                                )
+                            ocr_ok = False  # stop trying on subsequent scanned pages
+                        else:
+                            result.ocr_status = "ran"
                     if df.empty:
                         result.page_errors.append(
                             f"page {page_no}: scanned, OCR found no text"

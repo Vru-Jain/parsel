@@ -39,13 +39,9 @@ def _fmt_dur(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Pre-warm worker: load the embedding model once at startup, off the UI thread,
-# so the first "Process" click is instant instead of a multi-second freeze.
-
 # The app always runs from the project root (main.py is the entry point and
 # PyInstaller bundles with the root on sys.path), so this absolute import works
-# in both dev and frozen builds. The old relative-import fallback was invalid
-# ("beyond top-level package") and only ever masked the real import error.
+# in both dev and frozen builds.
 from engine.pipeline import process_file, ExcelLockedError
 
 
@@ -102,10 +98,21 @@ class ProcessWorker(QObject):
                     for note in result.qc_notes:
                         self.log.emit(f"  • {note}")
                     if result.page_errors:
-                        self.log.emit(
-                            f"  • {len(result.page_errors)} page(s) had no table "
-                            f"(see status)."
-                        )
+                        # Errors not tied to a specific page (e.g. engine init
+                        # failures) are shown in full so nothing critical is
+                        # silently swallowed. Per-page "no table" messages are
+                        # grouped to avoid flooding the console on large manuals.
+                        critical = [e for e in result.page_errors
+                                    if not e.startswith("page ")]
+                        per_page = [e for e in result.page_errors
+                                    if e.startswith("page ")]
+                        for err in critical:
+                            self.log.emit(f"  ✖ {err}")
+                        if per_page:
+                            self.log.emit(
+                                f"  • {len(per_page)} page(s) skipped "
+                                f"(no table or scanned without OCR)"
+                            )
                     if result.unmapped:
                         self.unmapped = result.unmapped
                         self.log.emit(
@@ -158,7 +165,7 @@ class DropZone(QFrame):
         f.setPointSize(12)
         f.setBold(True)
         lbl.setFont(f)
-        hint = QLabel("or click “Add Files” below   ·   PDF only")
+        hint = QLabel('or click "Add Files" below   ·   PDF only')
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #6b7280; font-size: 11px;")
         lay.addWidget(icon)
@@ -209,6 +216,9 @@ class MainWindow(QMainWindow):
         # one mapper instance reused across files (exact + fuzzy, no model)
         self.mapper = SemanticMapper(config)
 
+        # maps full path -> QListWidgetItem for per-file status updates
+        self._file_items: dict[str, QListWidgetItem] = {}
+
         # run-timing state (for ETA / throughput / elapsed)
         self._run_timer = QElapsedTimer()
         self._tick = QTimer(self)
@@ -238,10 +248,9 @@ class MainWindow(QMainWindow):
         # Plain-language 3-step guide
         root.addWidget(self._build_steps())
 
-        # Section: choose files
+        # ---- Section 1: choose files ----
         root.addWidget(self._section_label("1 · Choose your manual"))
 
-        # Top: drop zone + file controls
         self.drop = DropZone()
         self.drop.files_dropped.connect(self.add_files)
         root.addWidget(self.drop)
@@ -249,14 +258,17 @@ class MainWindow(QMainWindow):
         file_row = QHBoxLayout()
         self.add_btn = QPushButton("Add Files…")
         self.add_btn.clicked.connect(self._pick_files)
-        self.clear_btn = QPushButton("Clear")
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self._remove_selected_file)
+        self.remove_btn.setToolTip("Remove the selected file from the queue.")
+        self.clear_btn = QPushButton("Clear All")
         self.clear_btn.clicked.connect(self._clear_files)
         self.settings_btn = QPushButton("⚙ Settings")
         self.settings_btn.clicked.connect(self._open_settings)
         file_row.addWidget(self.add_btn)
+        file_row.addWidget(self.remove_btn)
         file_row.addWidget(self.clear_btn)
         file_row.addStretch(1)
-        # Flexible page picker: choose exactly the pages that hold parts tables.
         file_row.addWidget(QLabel("Pages:"))
         self.pages_input = QLineEdit()
         self.pages_input.setPlaceholderText("e.g. 1-5, 12, 20-30   (blank = all)")
@@ -280,10 +292,9 @@ class MainWindow(QMainWindow):
         self.file_list.setMaximumHeight(110)
         root.addWidget(self.file_list)
 
-        # Section: progress
+        # ---- Section 2: convert ----
         root.addWidget(self._section_label("2 · Convert"))
 
-        # Middle: progress + status console
         self.progress = QProgressBar()
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
@@ -293,7 +304,6 @@ class MainWindow(QMainWindow):
         status_row = QHBoxLayout()
         self.status_label = QLabel("Ready.")
         status_row.addWidget(self.status_label, stretch=1)
-        # column-matcher chip — instant exact + fuzzy (no model to load)
         self.matcher_chip = QLabel("● Matching: exact + fuzzy")
         self.matcher_chip.setStyleSheet("color: #1c7c3c;")
         self.matcher_chip.setToolTip(
@@ -316,23 +326,28 @@ class MainWindow(QMainWindow):
         self.console.setFont(mono)
         root.addWidget(self.console, stretch=1)
 
-        # Bottom: action buttons
+        # ---- Section 3: save ----
+        root.addWidget(self._section_label("3 · Save"))
+
         action_row = QHBoxLayout()
         # "&&" so Qt shows a literal "&" instead of treating it as a mnemonic
         self.process_btn = QPushButton("Process && Preview")
         self.process_btn.setObjectName("primaryButton")
         self.process_btn.setMinimumHeight(44)
-        self.process_btn.setToolTip("Read the PDF and create the Excel sheet.")
+        self.process_btn.setToolTip(
+            "Extract tables from the PDF(s) and open a preview — "
+            "nothing is saved until you confirm in the preview."
+        )
         self.process_btn.clicked.connect(self._start_processing)
         self.abort_btn = QPushButton("Abort")
         self.abort_btn.setEnabled(False)
         self.abort_btn.clicked.connect(self._abort_processing)
-        # post-run actions: revealed once an Excel has been produced
-        self.open_btn = QPushButton("📂 Open Excel")
+        # post-run shortcuts: revealed once an Excel has been saved
+        self.open_btn = QPushButton("📊 Open Excel")
         self.open_btn.setObjectName("openButton")
         self.open_btn.clicked.connect(self._open_output)
         self.open_btn.setVisible(False)
-        self.folder_btn = QPushButton("Open Folder")
+        self.folder_btn = QPushButton("📁 Open Folder")
         self.folder_btn.clicked.connect(self._open_folder)
         self.folder_btn.setVisible(False)
         action_row.addWidget(self.process_btn, stretch=1)
@@ -444,12 +459,34 @@ class MainWindow(QMainWindow):
                 item = QListWidgetItem(os.path.basename(p))
                 item.setToolTip(p)
                 self.file_list.addItem(item)
-        self.status_label.setText(f"{len(self.files)} file(s) queued.")
+                self._file_items[p] = item
+        count = len(self.files)
+        self.status_label.setText(f"{count} file(s) queued." if count else "Ready.")
+
+    def _remove_selected_file(self):
+        row = self.file_list.currentRow()
+        if row < 0:
+            return
+        item = self.file_list.takeItem(row)
+        if item:
+            path = item.toolTip()
+            if path in self.files:
+                self.files.remove(path)
+            self._file_items.pop(path, None)
+        count = len(self.files)
+        self.status_label.setText(f"{count} file(s) queued." if count else "Ready.")
 
     def _clear_files(self):
         self.files.clear()
         self.file_list.clear()
+        self._file_items.clear()
         self.status_label.setText("Ready.")
+
+    def _item_for_name(self, name: str) -> QListWidgetItem | None:
+        for path, item in self._file_items.items():
+            if os.path.basename(path) == name:
+                return item
+        return None
 
     # ----- processing ------------------------------------------------- #
     def _parse_pages(self):
@@ -481,18 +518,27 @@ class MainWindow(QMainWindow):
         if pages:
             self._log(f"Pages selected: {len(pages)} "
                       f"({min(pages)}–{max(pages)})")
-        self._results = []   # collected per-file results for the preview
+        self._results = []
+
+        # Reset file-list status prefixes left over from a previous run.
+        for path, item in self._file_items.items():
+            item.setText(os.path.basename(path))
 
         self.process_btn.setEnabled(False)
         self.add_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
         self.abort_btn.setEnabled(True)
         self.open_btn.setVisible(False)
         self.folder_btn.setVisible(False)
         self.drop.setEnabled(False)
-        # indeterminate (marquee) until the first page-count arrives
-        self.progress.setRange(0, 0)
+
+        # Reset progress bar from any previous run, then enter indeterminate marquee.
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
         self.progress.setFormat("Preparing…")
+        self.progress.setRange(0, 0)
+
         self._run_timer.restart()
         self._last_eta = ""
         self._tick.start()
@@ -506,6 +552,8 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.log.connect(self._log)
+        self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_done.connect(self._on_file_done)
         self.worker.file_error.connect(self._on_file_error)
         # worker done -> stop the thread's event loop; the UI finalization runs
         # on QThread.finished (after the thread truly stops) so we NEVER call
@@ -521,9 +569,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Aborting after current file…")
 
     def _on_progress(self, cur, total, msg):
-        # progress now arrives on a single 0-100 percent scale (see pipeline);
-        # the human-readable phase (e.g. "Extracting page 100 (3/4)") is in msg
-        # and shown in the status line below the bar.
         self._last_msg = msg
         if total > 0:
             if self.progress.maximum() == 0:           # leave marquee mode
@@ -546,13 +591,23 @@ class MainWindow(QMainWindow):
                                   if tail else self._last_msg)
 
     def _update_clock(self):
-        # keep elapsed/ETA ticking even between page callbacks
         if self.thread is not None:
             self._refresh_status()
 
-    def _on_file_error(self, name, msg):
-        # already logged in console; keep going with the batch
-        pass
+    def _on_file_started(self, name: str):
+        item = self._item_for_name(name)
+        if item:
+            item.setText(f"⏳ {name}")
+
+    def _on_file_done(self, name: str):
+        item = self._item_for_name(name)
+        if item:
+            item.setText(f"✔ {name}")
+
+    def _on_file_error(self, name: str, msg: str):
+        item = self._item_for_name(name)
+        if item:
+            item.setText(f"✖ {name}")
 
     def _on_finished(self):
         # Runs on QThread.finished — the worker has fully stopped, so it's safe
@@ -566,11 +621,11 @@ class MainWindow(QMainWindow):
         elapsed = _fmt_dur(self._run_timer.elapsed() / 1000.0)
         self.process_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
+        self.remove_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.abort_btn.setEnabled(False)
         self.drop.setEnabled(True)
 
-        # pull results off the worker, then schedule it + the thread for deletion
         if self.worker is not None:
             self._results = list(self.worker.results)
             self.last_unmapped = list(self.worker.unmapped)
@@ -604,20 +659,14 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"Finished in {elapsed} — no parts found.")
 
-        if self.last_unmapped:
-            QMessageBox.information(
-                self, "Unmapped columns",
-                "Some columns couldn't be mapped automatically:\n\n"
-                + "\n".join(f"• {c}" for c in self.last_unmapped)
-                + "\n\nOpen Settings ▸ Mappings to link them, then reprocess.",
-            )
+        # Unmapped-column notice is shown as a banner inside the preview dialog
+        # (while the user can still act on it). No second popup here.
 
     # ----- settings --------------------------------------------------- #
     def _open_settings(self):
         from ui.settings_dialog import SettingsDialog
         dlg = SettingsDialog(self.config, self.paths, self.last_unmapped, self)
         if dlg.exec():
-            # config saved -> reload from disk + rebuild mapper
             try:
                 with open(self.paths["config_path"], "r", encoding="utf-8") as fh:
                     self.config = json.load(fh)
@@ -655,8 +704,6 @@ class MainWindow(QMainWindow):
         self.console.appendPlainText(text)
 
     def closeEvent(self, event):
-        # quit() is called DIRECTLY here (not via a queued signal), so wait()
-        # won't deadlock; bounded so closing is never hung.
         if self.thread is not None and self.thread.isRunning():
             if self.worker is not None:
                 self.worker.abort()
